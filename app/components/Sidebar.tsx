@@ -20,11 +20,9 @@ export default function Sidebar({ currentChatId, onSelectChat, onNewChat, isOpen
 
   const handleDelete = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
-    if (confirm('Are you sure you want to delete this chat?')) {
-      await deleteConversation(id);
-      if (currentChatId === id) {
-        onNewChat();
-      }
+    await deleteConversation(id);
+    if (currentChatId === id) {
+      onNewChat();
     }
   };
 

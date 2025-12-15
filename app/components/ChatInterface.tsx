@@ -15,6 +15,8 @@ export default function ChatInterface() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isNearBottom, setIsNearBottom] = useState(true);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -37,20 +39,32 @@ export default function ChatInterface() {
     await createConversation(newId, 'New Chat');
     setCurrentChatId(newId);
     setMessages([]);
-    // Focus input?
   };
 
   const handleSelectChat = (id: string) => {
     setCurrentChatId(id);
   };
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
   };
 
+  // Check scroll position to determine if we should auto-scroll
+  const handleScroll = () => {
+    if (!scrollContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
+
+    // Consider "near bottom" if within 100px of the bottom
+    const isBottom = scrollHeight - scrollTop - clientHeight < 100;
+    setIsNearBottom(isBottom);
+  };
+
+  // Auto-scroll on new messages ONLY if user was already near bottom
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    if (isNearBottom) {
+       scrollToBottom();
+    }
+  }, [messages, isNearBottom]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -206,7 +220,11 @@ export default function ChatInterface() {
         </div>
 
         {/* Messages Area */}
-        <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-700 w-full">
+        <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-700 w-full"
+        >
            {messages.length === 0 ? (
              /* Empty State */
              <div className="flex flex-col items-center justify-center h-full px-4">
