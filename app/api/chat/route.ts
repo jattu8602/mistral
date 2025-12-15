@@ -30,6 +30,9 @@ export async function POST(req: Request) {
         max_tokens: 2000,
         mode: "instruction",
         stream: true, // Enable streaming
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.2, // Stronger penalty for loops
       }),
     });
 

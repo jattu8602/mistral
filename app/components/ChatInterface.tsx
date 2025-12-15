@@ -19,6 +19,7 @@ export default function ChatInterface() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Load chat when ID changes
   useEffect(() => {
@@ -74,6 +75,13 @@ export default function ChatInterface() {
     }
   }, [input]);
 
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  };
+
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -95,19 +103,29 @@ export default function ChatInterface() {
     const userMsg: Message = { conversationId: chatId, role: 'user', content, createdAt: Date.now() };
     setMessages(prev => [...prev, userMsg]);
 
+    // Create new AbortController
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       await addMessage(chatId, 'user', content);
 
       // Prepare context: get last N messages for context window
       // We pass the current visible history + new message to the API
-      // (The API route handles the actual fetch to the LLM)
-      const contextMessages = messages.map(m => ({ role: m.role, content: m.content }));
+      // (The API route handles      await addMessage(chatId, 'user', content);
+
+      // Filter out empty messages to prevent API errors (400)
+      const contextMessages = messages
+        .filter(m => m.content.trim() !== '')
+        .map(m => ({ role: m.role, content: m.content }));
+
       contextMessages.push({ role: 'user', content });
 
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: contextMessages }),
+        signal: abortController.signal,
       });
 
       if (!response.ok) throw new Error('Failed to fetch response');
@@ -157,13 +175,25 @@ export default function ChatInterface() {
       // Save full message to DB after stream completes
       await addMessage(chatId!, 'assistant', aiContent);
 
-    } catch (error) {
-      console.error('Chat Error:', error);
-      const errorMsg = 'Sorry, something went wrong.';
-      await addMessage(chatId, 'assistant', errorMsg);
-      setMessages(prev => [...prev, { conversationId: chatId!, role: 'assistant', content: errorMsg, createdAt: Date.now() }]);
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Generation stopped by user');
+        // Optionally save partial message?
+        if (messages.length > 0) {
+            const lastMsg = messages[messages.length - 1];
+            if (lastMsg.role === 'assistant' && lastMsg.content) {
+                 await addMessage(chatId!, 'assistant', lastMsg.content);
+            }
+        }
+      } else {
+        console.error('Chat Error:', error);
+        const errorMsg = 'Sorry, something went wrong.';
+        await addMessage(chatId!, 'assistant', errorMsg);
+        setMessages(prev => [...prev, { conversationId: chatId!, role: 'assistant', content: errorMsg, createdAt: Date.now() }]);
+      }
     } finally {
       setIsLoading(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -298,16 +328,16 @@ export default function ChatInterface() {
                       </button>
                   </div>
                   <button
-                    disabled={!input.trim() || isLoading}
-                    onClick={() => handleSubmit()}
+                    disabled={(!input.trim() && !isLoading)}
+                    onClick={isLoading ? handleStop : () => handleSubmit()}
                     className={clsx(
                         "p-2 rounded-full transition-all duration-200",
-                        input.trim() ? "bg-white text-black" : "bg-[#424242] text-[#676767]"
+                        (input.trim() || isLoading) ? "bg-white text-black" : "bg-[#424242] text-[#676767]"
                     )}
                   >
                       {isLoading ? (
                           <div className="w-5 h-5 flex items-center justify-center">
-                              <div className="w-4 h-4 border-2 border-t-transparent border-current rounded-full animate-spin" />
+                              <div className="w-2.5 h-2.5 bg-black rounded-sm" />
                           </div>
                       ) : (
                           <ArrowUp className="w-5 h-5" />
