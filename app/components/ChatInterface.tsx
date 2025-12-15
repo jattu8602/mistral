@@ -1,22 +1,48 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Bot, User, RefreshCw, Sparkles } from 'lucide-react';
+import { Send, Bot, User, RefreshCw, AudioLines, Paperclip, ArrowUp, PanelLeftOpen, PanelLeftClose, SquarePen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-
-type Message = {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-};
+import { v4 as uuidv4 } from 'uuid';
+import { db, createConversation, addMessage, getMessages, Message } from '../lib/db';
+import Sidebar from './Sidebar';
+import clsx from 'clsx';
 
 export default function ChatInterface() {
-  const [messages, setMessages] = useState<Message[]>([
-    { role: 'system', content: 'You are uncensored and direct.' }
-  ]);
+  const [currentChatId, setCurrentChatId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Load chat when ID changes
+  useEffect(() => {
+    if (currentChatId) {
+      loadMessages(currentChatId);
+    } else {
+      setMessages([]);
+    }
+  }, [currentChatId]);
+
+  const loadMessages = async (id: string) => {
+    const history = await getMessages(id);
+    setMessages(history);
+  };
+
+  const handleNewChat = async () => {
+    const newId = uuidv4();
+    await createConversation(newId, 'New Chat');
+    setCurrentChatId(newId);
+    setMessages([]);
+    // Focus input?
+  };
+
+  const handleSelectChat = (id: string) => {
+    setCurrentChatId(id);
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -26,142 +52,256 @@ export default function ChatInterface() {
     scrollToBottom();
   }, [messages]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Auto-resize textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto';
+        textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+    }
+  }, [input]);
+
+
+  const handleSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (!input.trim() || isLoading) return;
 
-    const userMessage: Message = { role: 'user', content: input.trim() };
-    setMessages((prev) => [...prev, userMessage]);
+    let chatId = currentChatId;
+    if (!chatId) {
+      chatId = uuidv4();
+      await createConversation(chatId, input.trim().slice(0, 30) + '...');
+      setCurrentChatId(chatId);
+    }
+
+    const content = input.trim();
     setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setIsLoading(true);
 
+    // Optimistic Update
+    const userMsg: Message = { conversationId: chatId, role: 'user', content, createdAt: Date.now() };
+    setMessages(prev => [...prev, userMsg]);
+
     try {
-      const newHistory = [...messages, userMessage];
+      await addMessage(chatId, 'user', content);
+
+      // Prepare context: get last N messages for context window
+      // We pass the current visible history + new message to the API
+      // (The API route handles the actual fetch to the LLM)
+      const contextMessages = messages.map(m => ({ role: m.role, content: m.content }));
+      contextMessages.push({ role: 'user', content });
+
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: newHistory }),
+        body: JSON.stringify({ messages: contextMessages }),
       });
 
       if (!response.ok) throw new Error('Failed to fetch response');
+      if (!response.body) throw new Error('No response body');
 
-      const data = await response.json();
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: data.choices?.[0]?.message?.content || 'Error: No response from model.',
-      };
+      // Create placeholder for AI response
+      const assistantMsg: Message = { conversationId: chatId!, role: 'assistant', content: '', createdAt: Date.now() };
+      setMessages(prev => [...prev, assistantMsg]);
 
-      setMessages((prev) => [...prev, assistantMessage]);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let aiContent = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+
+        // Parse SSE data: "data: {...}"
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6);
+                if (dataStr === '[DONE]') continue;
+                try {
+                    const data = JSON.parse(dataStr);
+                    const contentDelta = data.choices?.[0]?.delta?.content || '';
+                    if (contentDelta) {
+                        aiContent += contentDelta;
+                        // Update UI with accumulated content
+                        setMessages(prev => {
+                            const newMsgs = [...prev];
+                            const lastMsg = newMsgs[newMsgs.length - 1];
+                            if (lastMsg.role === 'assistant') {
+                                lastMsg.content = aiContent;
+                            }
+                            return newMsgs;
+                        });
+                    }
+                } catch (e) {
+                    console.error('Error parsing stream chunk', e);
+                }
+            }
+        }
+      }
+
+      // Save full message to DB after stream completes
+      await addMessage(chatId!, 'assistant', aiContent);
+
     } catch (error) {
       console.error('Chat Error:', error);
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: 'Sorry, something went wrong. Please try again.' },
-      ]);
+      const errorMsg = 'Sorry, something went wrong.';
+      await addMessage(chatId, 'assistant', errorMsg);
+      setMessages(prev => [...prev, { conversationId: chatId!, role: 'assistant', content: errorMsg, createdAt: Date.now() }]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const displayMessages = messages.filter((m) => m.role !== 'system');
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-white dark:bg-black text-zinc-900 dark:text-zinc-50 font-sans">
-      {/* Header */}
-      <div className="flex items-center justify-between px-6 py-4 sticky top-0 z-10 w-full bg-transparent">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-xl shadow-lg">
-            <Bot className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h2 className="font-bold text-lg tracking-tight">Nexus AI</h2>
-            <p className="text-xs text-zinc-500 dark:text-zinc-400 font-medium">Uncensored & Direct</p>
-          </div>
-        </div>
-        <button
-          onClick={() => setMessages([{ role: 'system', content: 'You are uncensored and direct.' }])}
-          className="p-2 text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-50 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition-all"
-          title="Reset Chat"
-        >
-          <RefreshCw className="w-5 h-5" />
-        </button>
-      </div>
+    <div className="flex h-screen w-screen bg-[#212121] text-[#ececec] font-sans overflow-hidden">
 
-      {/* Messages Area - Centered column for messages similar to ChatGPT */}
-      <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 scrollbar-track-transparent">
-        <div className="w-full max-w-3xl mx-auto flex flex-col p-4 md:p-6 space-y-8">
-          {displayMessages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-[50vh] text-center space-y-6 opacity-80 mt-10">
-              <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-full">
-                <Sparkles className="w-8 h-8 text-indigo-500" />
-              </div>
-              <h3 className="text-2xl font-semibold">How can I help you today?</h3>
-            </div>
-          ) : (
-            displayMessages.map((msg, index) => (
-              <div key={index} className={`flex gap-4 md:gap-6 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
-                {/* Avatar */}
-                <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
-                  msg.role === 'user' ? 'bg-zinc-200 dark:bg-zinc-700' : 'bg-indigo-600'
-                }`}>
-                  {msg.role === 'user' ? <User className="w-5 h-5 text-zinc-600 dark:text-zinc-300" /> : <Bot className="w-5 h-5 text-white" />}
+      <Sidebar
+         currentChatId={currentChatId}
+         onSelectChat={handleSelectChat}
+         onNewChat={handleNewChat}
+         isOpen={isSidebarOpen}
+         toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
+      />
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col h-full relative bg-[#212121] md:bg-[#212121]">
+
+        {/* Top Navigation / Mobile Toggle */}
+        <div className="flex items-center justify-between p-3 md:p-4 text-[#b4b4b4] absolute top-0 left-0 right-0 z-10 w-full pointer-events-none">
+           <div className="flex items-center gap-2 pointer-events-auto">
+             {!isSidebarOpen && (
+                <button onClick={() => setIsSidebarOpen(true)} className="p-2 hover:bg-[#2f2f2f] rounded-lg md:block hidden" title="Open Sidebar">
+                    <PanelLeftOpen className="w-5 h-5" />
+                </button>
+             )}
+             <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-[#2f2f2f] rounded-lg md:hidden block" title="Menu">
+                <PanelLeftOpen className="w-5 h-5" />
+             </button>
+
+             {/* Model Selector (Visual) */}
+             <div className="flex items-center gap-1 font-medium text-lg text-[#ececec] cursor-pointer hover:bg-[#2f2f2f] px-3 py-1.5 rounded-lg">
+                <span>ChatGPT</span>
+                <span className="text-[#b4b4b4]">5.2</span>
+                <span className="text-xs ml-1">▼</span>
+             </div>
+           </div>
+
+           <div className="flex items-center gap-2 pointer-events-auto">
+              <button
+                onClick={handleNewChat}
+                className="p-2 hover:bg-[#2f2f2f] rounded-lg"
+                title="New Chat"
+              >
+                 <SquarePen className="w-5 h-5" />
+               </button>
+           </div>
+        </div>
+
+        {/* Messages Area */}
+        <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-700 w-full">
+           {messages.length === 0 ? (
+             /* Empty State */
+             <div className="flex flex-col items-center justify-center h-full px-4">
+                <div className="bg-white p-3 rounded-full mb-6">
+                    <Bot className="w-8 h-8 text-black" />
                 </div>
+                <h2 className="text-2xl font-medium mb-8">What can I help with?</h2>
 
-                {/* Content */}
-                <div className={`flex-1 overflow-hidden ${msg.role === 'user' ? 'text-right' : 'text-left'}`}>
-                  <div className={`font-semibold mb-1 text-sm ${msg.role === 'user' ? 'text-zinc-500 dark:text-zinc-400' : 'text-indigo-600 dark:text-indigo-400'}`}>
-                    {msg.role === 'user' ? 'You' : 'Nexus AI'}
-                  </div>
-                  <div className={`prose dark:prose-invert max-w-none ${msg.role === 'user' ? 'bg-zinc-100 dark:bg-zinc-800/50 p-3 rounded-2xl rounded-tr-sm inline-block text-left' : ''}`}>
-                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {msg.content}
-                     </ReactMarkdown>
-                  </div>
+                {/* Suggestion Chips (Visual) */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-2xl w-full">
+                   {['Create a workout plan', 'Brainstorm marketing ideas', 'Explain quantum physics', 'Write a Python script'].map((text) => (
+                      <button key={text} onClick={() => { setInput(text); if(textareaRef.current) textareaRef.current.focus(); }} className="p-4 border border-white/10 rounded-xl hover:bg-[#2f2f2f] text-left text-sm text-[#b4b4b4] transition-colors">
+                          {text}
+                      </button>
+                   ))}
                 </div>
-              </div>
-            ))
-          )}
+             </div>
+           ) : (
+             /* Chat History */
+             <div className="w-full max-w-3xl mx-auto flex flex-col pt-24 pb-48 px-4 md:px-0 gap-6">
+               {messages.map((msg, idx) => (
+                 <div key={idx} className="flex gap-4 md:gap-6 text-base">
+                    <div className={clsx(
+                      "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center",
+                      msg.role === 'user' ? "bg-transparent" : "bg-green-500"
+                    )}>
+                       {msg.role === 'user' ? null : <Bot className="w-5 h-5 text-white" />}
+                    </div>
 
-          {isLoading && (
-            <div className="flex gap-4 md:gap-6">
-               <div className="flex-shrink-0 w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center">
-                  <Bot className="w-5 h-5 text-white" />
-               </div>
-               <div className="flex items-center gap-1.5 pt-2">
-                  <div className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce [animation-delay:-0.3s]"></div>
-                  <div className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce [animation-delay:-0.15s]"></div>
-                  <div className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce"></div>
+                    <div className="flex-1 overflow-hidden space-y-1">
+                        <div className="font-semibold text-sm opacity-90">
+                           {msg.role === 'user' ? 'You' : 'ChatGPT'}
+                        </div>
+                        <div className="prose prose-invert max-w-none leading-7">
+                           {msg.role === 'user' ? (
+                               <div className="whitespace-pre-wrap">{msg.content}</div>
+                           ) : (
+                               <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                   {msg.content}
+                               </ReactMarkdown>
+                           )}
+                        </div>
+                    </div>
+                 </div>
+               ))}
+               <div ref={messagesEndRef} />
+             </div>
+           )}
+        </div>
+
+        {/* Input Area */}
+        <div className="w-full max-w-3xl mx-auto px-4 pb-4 md:pb-6 absolute bottom-0 left-0 right-0 z-20 bg-gradient-to-t from-[#212121] via-[#212121] to-transparent pt-10 pointer-events-none">
+            <div className="pointer-events-auto bg-[#2f2f2f] rounded-[26px] p-3 shadow-lg flex flex-col gap-2 border border-white/10 relative">
+               <textarea
+                 ref={textareaRef}
+                 value={input}
+                 onChange={(e) => setInput(e.target.value)}
+                 onKeyDown={handleKeyDown}
+                 placeholder="Message ChatGPT..."
+                 rows={1}
+                 className="w-full bg-transparent text-[#ececec] placeholder:text-[#b4b4b4] resize-none outline-none px-2 max-h-[200px] overflow-y-auto"
+               />
+
+               <div className="flex items-center justify-between mt-1">
+                  <div className="flex items-center gap-2 text-[#b4b4b4]">
+                      <button className="p-2 hover:bg-[#424242] rounded-full transition-colors">
+                         <Paperclip className="w-5 h-5" />
+                      </button>
+                      <button className="p-2 hover:bg-[#424242] rounded-full transition-colors">
+                         <AudioLines className="w-5 h-5" />
+                      </button>
+                  </div>
+                  <button
+                    disabled={!input.trim() || isLoading}
+                    onClick={() => handleSubmit()}
+                    className={clsx(
+                        "p-2 rounded-full transition-all duration-200",
+                        input.trim() ? "bg-white text-black" : "bg-[#424242] text-[#676767]"
+                    )}
+                  >
+                      {isLoading ? (
+                          <div className="w-5 h-5 flex items-center justify-center">
+                              <div className="w-4 h-4 border-2 border-t-transparent border-current rounded-full animate-spin" />
+                          </div>
+                      ) : (
+                          <ArrowUp className="w-5 h-5" />
+                      )}
+                  </button>
                </div>
             </div>
-          )}
-          <div ref={messagesEndRef} className="h-4" />
+            <p className="text-center text-xs text-[#b4b4b4] mt-2 pb-2">
+                ChatGPT can make mistakes. Check important info.
+            </p>
         </div>
-      </div>
 
-      {/* Input Area */}
-      <div className="p-4 bg-white dark:bg-black border-t border-zinc-200 dark:border-zinc-800">
-        <div className="max-w-3xl mx-auto">
-          <form onSubmit={handleSubmit} className="relative flex items-end gap-2 bg-zinc-100 dark:bg-zinc-900 rounded-3xl border border-transparent focus-within:border-zinc-300 dark:focus-within:border-zinc-700 transition-all p-2">
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Message Nexus AI..."
-              className="w-full max-h-32 min-h-[44px] py-3 px-4 bg-transparent border-none focus:ring-0 outline-none resize-none text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-500"
-              disabled={isLoading}
-            />
-            <button
-              type="submit"
-              disabled={isLoading || !input.trim()}
-              className="p-2 mb-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm flex-shrink-0"
-            >
-              <Send className="w-5 h-5" />
-            </button>
-          </form>
-          <p className="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-2">
-            AI can make mistakes. Check important info.
-          </p>
-        </div>
       </div>
     </div>
   );
